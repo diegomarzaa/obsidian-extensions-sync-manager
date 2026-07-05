@@ -1,4 +1,4 @@
-.plugin-sync-manager {
+.extensions-sync-manager {
   --psm-border: var(--background-modifier-border);
   --psm-muted: var(--text-muted);
   --psm-panel: var(--background-primary);
@@ -8,11 +8,11 @@
   padding: 14px;
 }
 
-.plugin-sync-manager * {
+.extensions-sync-manager * {
   box-sizing: border-box;
 }
 
-.plugin-sync-manager h2 {
+.extensions-sync-manager h2 {
   margin: 0 0 12px;
   font-size: 20px;
 }

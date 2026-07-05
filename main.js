@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VIEW_TYPE = "plugin-sync-manager-view";
+const VIEW_TYPE = "extensions-sync-manager-view";
 const DESKTOP = "desktop";
 const MOBILE = "mobile";
 const PLUGIN_DESIRED = ["both", "desktop-only", "mobile-only", "frozen", "ignore", "remove"];
@@ -15,7 +15,7 @@ const MAX_VALUE_PREVIEW_CHARS = 6000;
 const DEFAULT_SETTINGS = {
   desktopConfigDir: ".obsidian",
   mobileConfigDir: ".obsidian_mobile",
-  backupDir: ".obsidian/plugins/plugin-sync-manager/backups",
+  backupDir: ".obsidian/plugins/extensions-sync-manager/backups",
 };
 
 function cloneJson(value) {
@@ -125,13 +125,13 @@ class PluginSyncManagerSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Migration").setHeading();
     new Setting(containerEl)
       .setName("Import legacy policy")
-      .setDesc("Imports existing policy and baseline data from 99 - Obsidian/plugin-sync into this plugin's data.json. The source files are not removed.")
+      .setDesc("Imports existing policy and baseline data from the legacy sync folder into data.json. The source files are not removed.")
       .addButton((button) => {
         button
           .setButtonText("Import")
           .onClick(async () => {
             const imported = await this.importLegacyFiles();
-            new Notice(imported ? "Legacy plugin sync files imported." : "No legacy files were found.");
+            new Notice(imported ? "Legacy extension sync files imported." : "No legacy files were found.");
           });
       });
   }
@@ -194,7 +194,7 @@ class PluginSyncManagerView extends ItemView {
   async onOpen() {
     this.rootEl = this.contentEl || this.containerEl.children[1];
     this.rootEl.empty();
-    this.rootEl.addClass("plugin-sync-manager");
+    this.rootEl.addClass("extensions-sync-manager");
     this.renderShell();
     await this.refresh();
   }
@@ -699,7 +699,7 @@ class PluginSyncManagerView extends ItemView {
   updatePolicy({ key, mode, desktopEnabledState, mobileEnabledState }) {
     const [kind, id] = String(key || "").split(":");
     if (!kind || !id) throw new Error("Missing key.");
-    if (mode !== undefined && kind === "plugin" && !PLUGIN_DESIRED.includes(mode)) throw new Error(`Unsupported plugin desired state: ${mode}`);
+    if (mode !== undefined && kind === "plugin" && !PLUGIN_DESIRED.includes(mode)) throw new Error(`Unsupported extension desired state: ${mode}`);
     if (mode !== undefined && kind === "config" && !CONFIG_DESIRED.includes(mode)) throw new Error(`Unsupported config desired state: ${mode}`);
     if (desktopEnabledState !== undefined && !ENABLED_STATES.includes(desktopEnabledState)) throw new Error(`Unsupported PC enabled state: ${desktopEnabledState}`);
     if (mobileEnabledState !== undefined && !ENABLED_STATES.includes(mobileEnabledState)) throw new Error(`Unsupported mobile enabled state: ${mobileEnabledState}`);
@@ -847,12 +847,12 @@ class PluginSyncManagerView extends ItemView {
 
     const search = document.createElement("input");
     search.addClass("psm-search");
-    search.placeholder = "Search plugin or config";
+    search.placeholder = "Search extension or config";
     toolbar.appendChild(search);
 
     const kindSelect = this.createSelect("psm-kind", [
       ["all", "All items"],
-      ["plugin", "Plugins"],
+      ["plugin", "Extensions"],
       ["config", "Base configs"],
     ]);
     toolbar.appendChild(kindSelect);
@@ -957,7 +957,7 @@ class PluginSyncManagerView extends ItemView {
       ["Needs action", c.needs],
       ["Review only", c.review],
       ["OK", c.ok],
-      ["Plugins", c.plugin],
+      ["Extensions", c.plugin],
       ["Configs", c.config],
     ];
     const summary = this.rootEl.querySelector(".psm-summary");
@@ -986,7 +986,7 @@ class PluginSyncManagerView extends ItemView {
   }
 
   desiredLabel(kind, mode) {
-    const plugin = {
+    const extensionLabels = {
       both: "Both devices",
       "desktop-only": "PC only",
       "mobile-only": "Mobile only",
@@ -1001,7 +1001,7 @@ class PluginSyncManagerView extends ItemView {
       frozen: "Frozen",
       ignore: "Ignored",
     };
-    return (kind === "plugin" ? plugin : config)[mode] || mode;
+    return (kind === "plugin" ? extensionLabels : config)[mode] || mode;
   }
 
   actionLabel(action, item) {
@@ -1055,7 +1055,7 @@ class PluginSyncManagerView extends ItemView {
       name.textContent = item.label;
       const kind = document.createElement("div");
       kind.addClass("psm-meta");
-      kind.textContent = item.kind;
+      kind.textContent = item.kind === "plugin" ? "extension" : item.kind;
       nameCell.append(name, kind);
       row.appendChild(nameCell);
 
@@ -1295,7 +1295,7 @@ class PluginSyncManagerView extends ItemView {
         const label = this.actionLabel(action, item);
         let extra = "A backup is created before overwriting or removing files.";
         if (action.type === "remove-completely") {
-          extra = "This removes the plugin from PC and mobile, disables it on both sides, and removes it from policy. Backups are created first.";
+          extra = "This removes the extension from PC and mobile, disables it on both sides, and removes it from policy. Backups are created first.";
         }
         if (!confirm(`Apply ${label} for ${item.label}?\n\n${extra}`)) return;
         try {
