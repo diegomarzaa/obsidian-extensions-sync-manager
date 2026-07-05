@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate release files
+        run: |
+          test -f main.js
+          test -f manifest.json
+          test -f styles.css
+          node --check main.js
+          jq . manifest.json >/dev/null
+          jq . versions.json >/dev/null
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" \
+            --verify-tag \
+            --title "$tag" \
+            --notes "Release $tag." \
+            main.js manifest.json styles.css
+
+      - name: Attest release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
