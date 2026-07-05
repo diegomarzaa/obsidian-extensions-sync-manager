@@ -1,0 +1,1 @@
+# obsidian-plugin-sync-manager
