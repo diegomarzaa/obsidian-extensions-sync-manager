@@ -1,6 +1,4 @@
 const { ItemView, Notice, Plugin, PluginSettingTab, Setting } = require("obsidian");
-const fs = require("fs");
-const path = require("path");
 const crypto = require("crypto");
 
 const VIEW_TYPE = "extensions-sync-manager-view";
@@ -43,6 +41,33 @@ function previewValue(value) {
 function normalizeRelativePath(value, fallback) {
   const text = String(value || "").trim();
   return text || fallback;
+}
+
+function joinVaultPath(...parts) {
+  return parts
+    .filter((part) => part !== undefined && part !== null && String(part).length > 0)
+    .map((part) => String(part).replace(/^\/+|\/+$/g, ""))
+    .join("/")
+    .replace(/\/+/g, "/");
+}
+
+function parentVaultPath(relativePath) {
+  const normalized = joinVaultPath(relativePath);
+  const index = normalized.lastIndexOf("/");
+  return index === -1 ? "" : normalized.slice(0, index);
+}
+
+function relativeVaultPath(root, fullPath) {
+  const normalizedRoot = joinVaultPath(root);
+  const normalizedFullPath = joinVaultPath(fullPath);
+  if (!normalizedRoot) return normalizedFullPath;
+  return normalizedFullPath.startsWith(`${normalizedRoot}/`)
+    ? normalizedFullPath.slice(normalizedRoot.length + 1)
+    : normalizedFullPath;
+}
+
+function bufferFromArrayBuffer(arrayBuffer) {
+  return Buffer.from(new Uint8Array(arrayBuffer));
 }
 
 class PluginSyncManagerPlugin extends Plugin {
@@ -153,17 +178,16 @@ class PluginSyncManagerSettingTab extends PluginSettingTab {
 
   async importLegacyFiles() {
     const adapter = this.plugin.app.vault.adapter;
-    const root = adapter.basePath;
     let imported = false;
 
-    const policyPath = path.join(root, "99 - Obsidian/plugin-sync/policy.json");
-    const statePath = path.join(root, "99 - Obsidian/plugin-sync/state.json");
-    if (fs.existsSync(policyPath)) {
-      this.plugin.pluginData.policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+    const policyPath = "99 - Obsidian/plugin-sync/policy.json";
+    const statePath = "99 - Obsidian/plugin-sync/state.json";
+    if (await adapter.exists(policyPath)) {
+      this.plugin.pluginData.policy = JSON.parse(await adapter.read(policyPath));
       imported = true;
     }
-    if (fs.existsSync(statePath)) {
-      this.plugin.pluginData.state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    if (await adapter.exists(statePath)) {
+      this.plugin.pluginData.state = JSON.parse(await adapter.read(statePath));
       imported = true;
     }
     if (imported) await this.plugin.savePluginData();
@@ -175,7 +199,6 @@ class PluginSyncManagerView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this.vaultRoot = plugin.app.vault.adapter.basePath;
     this.data = null;
   }
 
@@ -203,8 +226,8 @@ class PluginSyncManagerView extends ItemView {
     this.rootEl?.empty();
   }
 
-  absolute(relativePath) {
-    return path.join(this.vaultRoot, relativePath);
+  adapter() {
+    return this.plugin.app.vault.adapter;
   }
 
   desktopRoot() {
@@ -215,36 +238,50 @@ class PluginSyncManagerView extends ItemView {
     return this.plugin.settings.mobileConfigDir;
   }
 
-  readJson(relativePath, fallback) {
-    const fullPath = this.absolute(relativePath);
-    if (!fs.existsSync(fullPath)) return fallback;
+  async readJson(relativePath, fallback) {
+    const normalizedPath = joinVaultPath(relativePath);
+    if (!await this.exists(normalizedPath)) return fallback;
     try {
-      return JSON.parse(fs.readFileSync(fullPath, "utf8"));
+      return JSON.parse(await this.adapter().read(normalizedPath));
     } catch (error) {
-      throw new Error(`Could not read JSON: ${relativePath}. ${error.message}`);
+      throw new Error(`Could not read JSON: ${normalizedPath}. ${error.message}`);
     }
   }
 
-  writeJson(relativePath, data) {
-    const fullPath = this.absolute(relativePath);
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, JSON.stringify(data, null, 2) + "\n", "utf8");
+  async writeJson(relativePath, data) {
+    await this.writeText(relativePath, JSON.stringify(data, null, 2) + "\n");
   }
 
-  exists(relativePath) {
-    return fs.existsSync(this.absolute(relativePath));
+  async writeText(relativePath, text) {
+    const normalizedPath = joinVaultPath(relativePath);
+    await this.ensureFolder(parentVaultPath(normalizedPath));
+    await this.adapter().write(normalizedPath, text);
+  }
+
+  async exists(relativePath) {
+    return this.adapter().exists(joinVaultPath(relativePath));
+  }
+
+  async stat(relativePath) {
+    if (!await this.exists(relativePath)) return null;
+    return this.adapter().stat(joinVaultPath(relativePath));
+  }
+
+  async ensureFolder(relativePath) {
+    const normalizedPath = joinVaultPath(relativePath);
+    if (!normalizedPath || await this.exists(normalizedPath)) return;
+    await this.ensureFolder(parentVaultPath(normalizedPath));
+    await this.adapter().mkdir(normalizedPath);
   }
 
   timestamp() {
     return new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
   }
 
-  backupPath(relativePath, policy) {
-    const source = this.absolute(relativePath);
-    if (!fs.existsSync(source)) return;
-    const target = this.absolute(`${policy.backupRoot}/${this.timestamp()}/${relativePath}`);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.cpSync(source, target, { recursive: true, force: true });
+  async backupPath(relativePath, policy) {
+    if (!await this.exists(relativePath)) return;
+    const target = joinVaultPath(policy.backupRoot, this.timestamp(), relativePath);
+    await this.copyPathDirect(relativePath, target);
   }
 
   loadPolicy() {
@@ -285,23 +322,23 @@ class PluginSyncManagerView extends ItemView {
     return hashes;
   }
 
-  loadOrCreatePolicy() {
+  async loadOrCreatePolicy() {
     let policy = this.loadPolicy();
     if (policy) return { policy, created: false };
-    policy = this.createDefaultPolicy();
+    policy = await this.createDefaultPolicy();
     this.savePolicy(policy);
     return { policy, created: true };
   }
 
-  createDefaultPolicy() {
-    const pluginIds = this.listPluginIds();
-    const configFiles = this.listConfigFiles();
+  async createDefaultPolicy() {
+    const pluginIds = await this.listPluginIds();
+    const configFiles = await this.listConfigFiles();
     const plugins = {};
-    const desktopEnabled = this.readEnabledPlugins(this.desktopRoot());
-    const mobileEnabled = this.readEnabledPlugins(this.mobileRoot());
+    const desktopEnabled = await this.readEnabledPlugins(this.desktopRoot());
+    const mobileEnabled = await this.readEnabledPlugins(this.mobileRoot());
     for (const id of pluginIds) {
-      const desktopExists = this.exists(`${this.desktopRoot()}/plugins/${id}`);
-      const mobileExists = this.exists(`${this.mobileRoot()}/plugins/${id}`);
+      const desktopExists = await this.exists(`${this.desktopRoot()}/plugins/${id}`);
+      const mobileExists = await this.exists(`${this.mobileRoot()}/plugins/${id}`);
       let mode = "both";
       if (desktopExists && !mobileExists) mode = "desktop-only";
       if (!desktopExists && mobileExists) mode = "mobile-only";
@@ -324,7 +361,7 @@ class PluginSyncManagerView extends ItemView {
     };
   }
 
-  normalizePolicy(policy) {
+  async normalizePolicy(policy) {
     policy.version = policy.version || 1;
     policy.roots = {
       ...(policy.roots || {}),
@@ -335,7 +372,7 @@ class PluginSyncManagerView extends ItemView {
     policy.plugins = policy.plugins || {};
     policy.rootConfigFiles = policy.rootConfigFiles || {};
 
-    for (const id of this.listPluginIds()) {
+    for (const id of await this.listPluginIds()) {
       if (!policy.plugins[id]) {
         policy.plugins[id] = {
           mode: "both",
@@ -348,37 +385,41 @@ class PluginSyncManagerView extends ItemView {
       policy.plugins[id].mobileEnabledState = policy.plugins[id].mobileEnabledState || policy.plugins[id].enabledState || "enabled";
     }
 
-    for (const file of this.listConfigFiles()) {
+    for (const file of await this.listConfigFiles()) {
       if (!policy.rootConfigFiles[file]) policy.rootConfigFiles[file] = { mode: "frozen" };
     }
     return policy;
   }
 
-  listDir(relativePath) {
-    const fullPath = this.absolute(relativePath);
-    if (!fs.existsSync(fullPath)) return [];
-    return fs.readdirSync(fullPath).sort();
+  async listDir(relativePath) {
+    const normalizedPath = joinVaultPath(relativePath);
+    if (!await this.exists(normalizedPath)) return [];
+    const listed = await this.adapter().list(normalizedPath);
+    return [...listed.folders, ...listed.files]
+      .map((entry) => relativeVaultPath(normalizedPath, entry))
+      .sort();
   }
 
-  listPluginIds() {
+  async listPluginIds() {
     const ids = new Set();
     for (const root of [this.desktopRoot(), this.mobileRoot()]) {
-      for (const entry of this.listDir(`${root}/plugins`)) ids.add(entry);
-      for (const id of this.readEnabledPlugins(root)) ids.add(id);
+      for (const entry of await this.listDir(`${root}/plugins`)) ids.add(entry);
+      for (const id of await this.readEnabledPlugins(root)) ids.add(id);
     }
     const policy = this.loadPolicy();
     for (const id of Object.keys(policy?.plugins || {})) ids.add(id);
     return Array.from(ids).sort();
   }
 
-  listConfigFiles() {
+  async listConfigFiles() {
     const ignored = new Set(["community-plugins.json", "plugins"]);
     const files = new Set();
     for (const root of [this.desktopRoot(), this.mobileRoot()]) {
-      for (const entry of this.listDir(root)) {
+      for (const entry of await this.listDir(root)) {
         if (ignored.has(entry)) continue;
         const relative = `${root}/${entry}`;
-        if (fs.existsSync(this.absolute(relative)) && fs.statSync(this.absolute(relative)).isFile() && entry.endsWith(".json")) {
+        const stat = await this.stat(relative);
+        if (stat && stat.type === "file" && entry.endsWith(".json")) {
           files.add(entry);
         }
       }
@@ -388,31 +429,31 @@ class PluginSyncManagerView extends ItemView {
     return Array.from(files).sort();
   }
 
-  readEnabledPlugins(root) {
-    return new Set(this.readJson(`${root}/community-plugins.json`, []));
+  async readEnabledPlugins(root) {
+    return new Set(await this.readJson(`${root}/community-plugins.json`, []));
   }
 
-  writeEnabledPlugins(root, enabledSet) {
-    this.writeJson(`${root}/community-plugins.json`, Array.from(enabledSet).sort());
+  async writeEnabledPlugins(root, enabledSet) {
+    await this.writeJson(`${root}/community-plugins.json`, Array.from(enabledSet).sort());
   }
 
-  setPluginEnabled(root, id, enabled) {
-    const enabledSet = this.readEnabledPlugins(root);
+  async setPluginEnabled(root, id, enabled) {
+    const enabledSet = await this.readEnabledPlugins(root);
     if (enabled) enabledSet.add(id);
     else enabledSet.delete(id);
-    this.writeEnabledPlugins(root, enabledSet);
+    await this.writeEnabledPlugins(root, enabledSet);
   }
 
-  describePath(relativePath) {
-    const fullPath = this.absolute(relativePath);
-    if (!fs.existsSync(fullPath)) {
+  async describePath(relativePath) {
+    const normalizedPath = joinVaultPath(relativePath);
+    const stat = await this.stat(normalizedPath);
+    if (!stat) {
       return { exists: false, hash: "", fileCount: 0, size: 0, mtimeMs: 0, json: null };
     }
-    const stat = fs.statSync(fullPath);
-    if (stat.isFile()) {
-      const buffer = fs.readFileSync(fullPath);
+    if (stat.type === "file") {
+      const buffer = bufferFromArrayBuffer(await this.adapter().readBinary(normalizedPath));
       let json = null;
-      if (relativePath.endsWith(".json")) {
+      if (normalizedPath.endsWith(".json")) {
         try {
           json = JSON.parse(buffer.toString("utf8"));
         } catch {
@@ -433,10 +474,10 @@ class PluginSyncManagerView extends ItemView {
     let fileCount = 0;
     let size = 0;
     let mtimeMs = stat.mtimeMs;
-    for (const file of this.walkFiles(fullPath)) {
-      const relativeFile = path.relative(fullPath, file).split(path.sep).join("/");
-      const buffer = fs.readFileSync(file);
-      const fileStat = fs.statSync(file);
+    for (const file of await this.walkFiles(normalizedPath)) {
+      const relativeFile = relativeVaultPath(normalizedPath, file);
+      const buffer = bufferFromArrayBuffer(await this.adapter().readBinary(file));
+      const fileStat = await this.stat(file);
       hash.update(relativeFile);
       hash.update(buffer);
       fileCount += 1;
@@ -446,19 +487,18 @@ class PluginSyncManagerView extends ItemView {
     return { exists: true, hash: hash.digest("hex"), fileCount, size, mtimeMs, json: null };
   }
 
-  walkFiles(root) {
+  async walkFiles(root) {
     const files = [];
-    for (const entry of fs.readdirSync(root).sort()) {
-      const fullPath = path.join(root, entry);
-      const stat = fs.statSync(fullPath);
-      if (stat.isDirectory()) files.push(...this.walkFiles(fullPath));
-      else files.push(fullPath);
-    }
+    const normalizedRoot = joinVaultPath(root);
+    if (!await this.exists(normalizedRoot)) return files;
+    const listed = await this.adapter().list(normalizedRoot);
+    for (const folder of listed.folders.sort()) files.push(...await this.walkFiles(folder));
+    for (const file of listed.files.sort()) files.push(file);
     return files;
   }
 
-  readPluginVersion(root, id) {
-    const manifest = this.readJson(`${root}/plugins/${id}/manifest.json`, null);
+  async readPluginVersion(root, id) {
+    const manifest = await this.readJson(`${root}/plugins/${id}/manifest.json`, null);
     return manifest?.version || "";
   }
 
@@ -477,16 +517,16 @@ class PluginSyncManagerView extends ItemView {
     return actions;
   }
 
-  scanPolicy(policy, state) {
-    policy = this.normalizePolicy(policy);
+  async scanPolicy(policy, state) {
+    policy = await this.normalizePolicy(policy);
     const items = [];
-    const desktopEnabled = this.readEnabledPlugins(policy.roots.desktop);
-    const mobileEnabled = this.readEnabledPlugins(policy.roots.mobile);
+    const desktopEnabled = await this.readEnabledPlugins(policy.roots.desktop);
+    const mobileEnabled = await this.readEnabledPlugins(policy.roots.mobile);
 
     for (const id of Object.keys(policy.plugins).sort()) {
       const config = policy.plugins[id] || {};
-      const desktop = this.describePath(`${policy.roots.desktop}/plugins/${id}`);
-      const mobile = this.describePath(`${policy.roots.mobile}/plugins/${id}`);
+      const desktop = await this.describePath(`${policy.roots.desktop}/plugins/${id}`);
+      const mobile = await this.describePath(`${policy.roots.mobile}/plugins/${id}`);
       const desktopEnabledState = config.desktopEnabledState || config.enabledState || "enabled";
       const mobileEnabledState = config.mobileEnabledState || config.enabledState || "enabled";
       const item = {
@@ -499,8 +539,8 @@ class PluginSyncManagerView extends ItemView {
         mobileEnabledState,
         desktop,
         mobile,
-        desktopVersion: this.readPluginVersion(policy.roots.desktop, id),
-        mobileVersion: this.readPluginVersion(policy.roots.mobile, id),
+        desktopVersion: await this.readPluginVersion(policy.roots.desktop, id),
+        mobileVersion: await this.readPluginVersion(policy.roots.mobile, id),
         desktopEnabled: desktopEnabled.has(id),
         mobileEnabled: mobileEnabled.has(id),
         status: desktop.exists && mobile.exists && desktop.hash === mobile.hash ? "same" : "different",
@@ -511,8 +551,8 @@ class PluginSyncManagerView extends ItemView {
 
     for (const fileName of Object.keys(policy.rootConfigFiles).sort()) {
       const config = policy.rootConfigFiles[fileName] || {};
-      const desktop = this.describePath(`${policy.roots.desktop}/${fileName}`);
-      const mobile = this.describePath(`${policy.roots.mobile}/${fileName}`);
+      const desktop = await this.describePath(`${policy.roots.desktop}/${fileName}`);
+      const mobile = await this.describePath(`${policy.roots.mobile}/${fileName}`);
       items.push({
         key: `config:${fileName}`,
         kind: "config",
@@ -537,10 +577,10 @@ class PluginSyncManagerView extends ItemView {
       .sort();
   }
 
-  currentScan() {
-    const loaded = this.loadOrCreatePolicy();
+  async currentScan() {
+    const loaded = await this.loadOrCreatePolicy();
     const state = this.loadState();
-    const scan = this.scanPolicy(loaded.policy, state);
+    const scan = await this.scanPolicy(loaded.policy, state);
     if (loaded.created) this.savePolicy(scan.policy);
     return { scan, state, policyCreated: loaded.created };
   }
@@ -684,8 +724,8 @@ class PluginSyncManagerView extends ItemView {
     return { ...raw, decision };
   }
 
-  getData() {
-    const { scan, state, policyCreated } = this.currentScan();
+  async getData() {
+    const { scan, state, policyCreated } = await this.currentScan();
     const items = scan.items.map((item) => this.compactItem(item, state.items?.[item.key]));
     const counts = items.reduce((acc, item) => {
       acc.total += 1;
@@ -696,7 +736,7 @@ class PluginSyncManagerView extends ItemView {
     return { scannedAt: scan.scannedAt, policyCreated, counts, items };
   }
 
-  updatePolicy({ key, mode, desktopEnabledState, mobileEnabledState }) {
+  async updatePolicy({ key, mode, desktopEnabledState, mobileEnabledState }) {
     const [kind, id] = String(key || "").split(":");
     if (!kind || !id) throw new Error("Missing key.");
     if (mode !== undefined && kind === "plugin" && !PLUGIN_DESIRED.includes(mode)) throw new Error(`Unsupported extension desired state: ${mode}`);
@@ -704,7 +744,7 @@ class PluginSyncManagerView extends ItemView {
     if (desktopEnabledState !== undefined && !ENABLED_STATES.includes(desktopEnabledState)) throw new Error(`Unsupported PC enabled state: ${desktopEnabledState}`);
     if (mobileEnabledState !== undefined && !ENABLED_STATES.includes(mobileEnabledState)) throw new Error(`Unsupported mobile enabled state: ${mobileEnabledState}`);
 
-    const policy = this.normalizePolicy(this.loadPolicy() || this.createDefaultPolicy());
+    const policy = await this.normalizePolicy(this.loadPolicy() || await this.createDefaultPolicy());
     if (kind === "plugin") {
       policy.plugins[id] = policy.plugins[id] || {};
       if (mode !== undefined) policy.plugins[id].mode = mode;
@@ -717,38 +757,38 @@ class PluginSyncManagerView extends ItemView {
     this.savePolicy(policy);
   }
 
-  applyAction(action) {
+  async applyAction(action) {
     if (!action || !action.type || !action.key) throw new Error("Missing action.");
-    const { scan } = this.currentScan();
+    const { scan } = await this.currentScan();
     const item = scan.items.find((entry) => entry.key === action.key);
     if (!item) throw new Error("Item not found.");
     const policy = scan.policy;
 
-    if (item.kind === "plugin") this.applyPluginAction(action, item, policy);
-    else this.applyConfigAction(action, item, policy);
+    if (item.kind === "plugin") await this.applyPluginAction(action, item, policy);
+    else await this.applyConfigAction(action, item, policy);
 
-    const next = this.currentScan();
+    const next = await this.currentScan();
     this.saveState(next.scan);
   }
 
-  applyPluginAction(action, item, policy) {
+  async applyPluginAction(action, item, policy) {
     const id = item.id;
     const desktopPath = `${policy.roots.desktop}/plugins/${id}`;
     const mobilePath = `${policy.roots.mobile}/plugins/${id}`;
-    if (action.type === "desktop-to-mobile") this.copyPath(desktopPath, mobilePath, policy);
-    else if (action.type === "mobile-to-desktop") this.copyPath(mobilePath, desktopPath, policy);
-    else if (action.type === "enforce-plugin-policy") this.enforcePluginPolicy(item, policy);
-    else if (action.type === "remove-completely") this.removePluginCompletely(item, policy);
+    if (action.type === "desktop-to-mobile") await this.copyPath(desktopPath, mobilePath, policy);
+    else if (action.type === "mobile-to-desktop") await this.copyPath(mobilePath, desktopPath, policy);
+    else if (action.type === "enforce-plugin-policy") await this.enforcePluginPolicy(item, policy);
+    else if (action.type === "remove-completely") await this.removePluginCompletely(item, policy);
   }
 
-  applyConfigAction(action, item, policy) {
+  async applyConfigAction(action, item, policy) {
     const desktopPath = `${policy.roots.desktop}/${item.id}`;
     const mobilePath = `${policy.roots.mobile}/${item.id}`;
-    if (action.type === "desktop-to-mobile") this.copyPath(desktopPath, mobilePath, policy);
-    if (action.type === "mobile-to-desktop") this.copyPath(mobilePath, desktopPath, policy);
+    if (action.type === "desktop-to-mobile") await this.copyPath(desktopPath, mobilePath, policy);
+    if (action.type === "mobile-to-desktop") await this.copyPath(mobilePath, desktopPath, policy);
   }
 
-  enforcePluginPolicy(item, policy) {
+  async enforcePluginPolicy(item, policy) {
     const id = item.id;
     const config = policy.plugins[id] || {};
     const mode = config.mode || "both";
@@ -756,83 +796,107 @@ class PluginSyncManagerView extends ItemView {
     const mobilePath = `${policy.roots.mobile}/plugins/${id}`;
 
     if (mode === "both") {
-      if (item.desktop.exists && !item.mobile.exists) this.copyPath(desktopPath, mobilePath, policy);
-      if (!item.desktop.exists && item.mobile.exists) this.copyPath(mobilePath, desktopPath, policy);
-      this.setPluginEnabled(policy.roots.desktop, id, config.desktopEnabledState !== "disabled");
-      this.setPluginEnabled(policy.roots.mobile, id, config.mobileEnabledState !== "disabled");
+      if (item.desktop.exists && !item.mobile.exists) await this.copyPath(desktopPath, mobilePath, policy);
+      if (!item.desktop.exists && item.mobile.exists) await this.copyPath(mobilePath, desktopPath, policy);
+      await this.setPluginEnabled(policy.roots.desktop, id, config.desktopEnabledState !== "disabled");
+      await this.setPluginEnabled(policy.roots.mobile, id, config.mobileEnabledState !== "disabled");
       return;
     }
 
     if (mode === "desktop-only") {
-      if (!item.desktop.exists && item.mobile.exists) this.copyPath(mobilePath, desktopPath, policy);
-      this.removePath(mobilePath, policy);
-      this.setPluginEnabled(policy.roots.desktop, id, config.desktopEnabledState !== "disabled");
-      this.setPluginEnabled(policy.roots.mobile, id, false);
+      if (!item.desktop.exists && item.mobile.exists) await this.copyPath(mobilePath, desktopPath, policy);
+      await this.removePath(mobilePath, policy);
+      await this.setPluginEnabled(policy.roots.desktop, id, config.desktopEnabledState !== "disabled");
+      await this.setPluginEnabled(policy.roots.mobile, id, false);
       return;
     }
 
     if (mode === "mobile-only") {
-      if (item.desktop.exists && !item.mobile.exists) this.copyPath(desktopPath, mobilePath, policy);
-      this.removePath(desktopPath, policy);
-      this.setPluginEnabled(policy.roots.desktop, id, false);
-      this.setPluginEnabled(policy.roots.mobile, id, config.mobileEnabledState !== "disabled");
+      if (item.desktop.exists && !item.mobile.exists) await this.copyPath(desktopPath, mobilePath, policy);
+      await this.removePath(desktopPath, policy);
+      await this.setPluginEnabled(policy.roots.desktop, id, false);
+      await this.setPluginEnabled(policy.roots.mobile, id, config.mobileEnabledState !== "disabled");
       return;
     }
 
-    if (mode === "remove") this.removePluginCompletely(item, policy);
+    if (mode === "remove") await this.removePluginCompletely(item, policy);
   }
 
-  removePluginCompletely(item, policy) {
-    this.removePath(`${policy.roots.desktop}/plugins/${item.id}`, policy);
-    this.removePath(`${policy.roots.mobile}/plugins/${item.id}`, policy);
-    this.setPluginEnabled(policy.roots.desktop, item.id, false);
-    this.setPluginEnabled(policy.roots.mobile, item.id, false);
+  async removePluginCompletely(item, policy) {
+    await this.removePath(`${policy.roots.desktop}/plugins/${item.id}`, policy);
+    await this.removePath(`${policy.roots.mobile}/plugins/${item.id}`, policy);
+    await this.setPluginEnabled(policy.roots.desktop, item.id, false);
+    await this.setPluginEnabled(policy.roots.mobile, item.id, false);
     delete policy.plugins[item.id];
     this.savePolicy(policy);
   }
 
-  copyPath(sourceRelative, targetRelative, policy) {
-    const source = this.absolute(sourceRelative);
-    const target = this.absolute(targetRelative);
-    if (!fs.existsSync(source)) throw new Error(`Source does not exist: ${sourceRelative}`);
-    this.backupPath(targetRelative, policy);
-    fs.rmSync(target, { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.cpSync(source, target, { recursive: true, force: true });
+  async copyPath(sourceRelative, targetRelative, policy) {
+    if (!await this.exists(sourceRelative)) throw new Error(`Source does not exist: ${sourceRelative}`);
+    await this.backupPath(targetRelative, policy);
+    await this.removePathDirect(targetRelative);
+    await this.copyPathDirect(sourceRelative, targetRelative);
   }
 
-  removePath(relativePath, policy) {
-    const fullPath = this.absolute(relativePath);
-    if (!fs.existsSync(fullPath)) return;
-    this.backupPath(relativePath, policy);
-    fs.rmSync(fullPath, { recursive: true, force: true });
+  async copyPathDirect(sourceRelative, targetRelative) {
+    const source = joinVaultPath(sourceRelative);
+    const target = joinVaultPath(targetRelative);
+    const stat = await this.stat(source);
+    if (!stat) return;
+    if (stat.type === "file") {
+      await this.ensureFolder(parentVaultPath(target));
+      await this.adapter().writeBinary(target, await this.adapter().readBinary(source));
+      return;
+    }
+    await this.ensureFolder(target);
+    const listed = await this.adapter().list(source);
+    for (const folder of listed.folders) {
+      await this.copyPathDirect(folder, joinVaultPath(target, relativeVaultPath(source, folder)));
+    }
+    for (const file of listed.files) {
+      await this.copyPathDirect(file, joinVaultPath(target, relativeVaultPath(source, file)));
+    }
   }
 
-  refreshBaseline() {
-    const { scan } = this.currentScan();
+  async removePath(relativePath, policy) {
+    if (!await this.exists(relativePath)) return;
+    await this.backupPath(relativePath, policy);
+    await this.removePathDirect(relativePath);
+  }
+
+  async removePathDirect(relativePath) {
+    const normalizedPath = joinVaultPath(relativePath);
+    const stat = await this.stat(normalizedPath);
+    if (!stat) return;
+    if (stat.type === "folder") await this.adapter().rmdir(normalizedPath, true);
+    else await this.adapter().remove(normalizedPath);
+  }
+
+  async refreshBaseline() {
+    const { scan } = await this.currentScan();
     this.saveState(scan);
   }
 
-  copyConfigKey({ key, property, source }) {
+  async copyConfigKey({ key, property, source }) {
     const [kind, fileName] = String(key || "").split(":");
     if (kind !== "config" || !fileName) throw new Error("Expected config key.");
     if (!property) throw new Error("Missing property.");
     if (![DESKTOP, MOBILE].includes(source)) throw new Error("Invalid source.");
 
-    const { scan } = this.currentScan();
+    const { scan } = await this.currentScan();
     const policy = scan.policy;
     const sourceRoot = source === DESKTOP ? policy.roots.desktop : policy.roots.mobile;
     const targetRoot = source === DESKTOP ? policy.roots.mobile : policy.roots.desktop;
     const sourcePath = `${sourceRoot}/${fileName}`;
     const targetPath = `${targetRoot}/${fileName}`;
-    const sourceJson = this.readJson(sourcePath, {});
-    const targetJson = this.readJson(targetPath, {});
+    const sourceJson = await this.readJson(sourcePath, {});
+    const targetJson = await this.readJson(targetPath, {});
 
-    this.backupPath(targetPath, policy);
+    await this.backupPath(targetPath, policy);
     if (Object.prototype.hasOwnProperty.call(sourceJson, property)) targetJson[property] = sourceJson[property];
     else delete targetJson[property];
-    this.writeJson(targetPath, targetJson);
-    this.refreshBaseline();
+    await this.writeJson(targetPath, targetJson);
+    await this.refreshBaseline();
   }
 
   renderShell() {
@@ -898,12 +962,12 @@ class PluginSyncManagerView extends ItemView {
     this.rootEl.querySelector(".psm-kind").addEventListener("change", () => this.renderRows());
     this.rootEl.querySelector(".psm-view").addEventListener("change", () => this.renderRows());
     this.rootEl.querySelector(".psm-refresh").addEventListener("click", () => this.refresh());
-    this.rootEl.querySelector(".psm-baseline").addEventListener("click", () => {
+    this.rootEl.querySelector(".psm-baseline").addEventListener("click", async () => {
       if (!confirm("Refresh baseline hashes without copying files?")) return;
       try {
-        this.refreshBaseline();
+        await this.refreshBaseline();
         new Notice("Extension sync baseline refreshed.");
-        this.refresh();
+        await this.refresh();
       } catch (error) {
         new Notice(error.message);
       }
@@ -932,7 +996,7 @@ class PluginSyncManagerView extends ItemView {
 
   async refresh() {
     try {
-      this.data = this.getData();
+      this.data = await this.getData();
       this.renderSummary();
       this.renderRows();
     } catch (error) {
@@ -1249,12 +1313,12 @@ class PluginSyncManagerView extends ItemView {
 
   bindRowEvents(tbody) {
     tbody.querySelectorAll("select[data-role='desired']").forEach((select) => {
-      select.addEventListener("change", () => {
+      select.addEventListener("change", async () => {
         const key = select.closest("tr").dataset.key;
         try {
-          this.updatePolicy({ key, mode: select.value });
+          await this.updatePolicy({ key, mode: select.value });
           new Notice("Desired state updated.");
-          this.refreshKeepingPosition();
+          await this.refreshKeepingPosition();
         } catch (error) {
           new Notice(error.message);
         }
@@ -1262,12 +1326,12 @@ class PluginSyncManagerView extends ItemView {
     });
 
     tbody.querySelectorAll("select[data-role='desktop-enabled']").forEach((select) => {
-      select.addEventListener("change", () => {
+      select.addEventListener("change", async () => {
         const key = select.closest("tr").dataset.key;
         try {
-          this.updatePolicy({ key, desktopEnabledState: select.value });
+          await this.updatePolicy({ key, desktopEnabledState: select.value });
           new Notice("PC enabled preference updated.");
-          this.refreshKeepingPosition();
+          await this.refreshKeepingPosition();
         } catch (error) {
           new Notice(error.message);
         }
@@ -1275,12 +1339,12 @@ class PluginSyncManagerView extends ItemView {
     });
 
     tbody.querySelectorAll("select[data-role='mobile-enabled']").forEach((select) => {
-      select.addEventListener("change", () => {
+      select.addEventListener("change", async () => {
         const key = select.closest("tr").dataset.key;
         try {
-          this.updatePolicy({ key, mobileEnabledState: select.value });
+          await this.updatePolicy({ key, mobileEnabledState: select.value });
           new Notice("Mobile enabled preference updated.");
-          this.refreshKeepingPosition();
+          await this.refreshKeepingPosition();
         } catch (error) {
           new Notice(error.message);
         }
@@ -1288,7 +1352,7 @@ class PluginSyncManagerView extends ItemView {
     });
 
     tbody.querySelectorAll("button[data-role='apply-action']").forEach((button) => {
-      button.addEventListener("click", () => {
+      button.addEventListener("click", async () => {
         const row = button.closest("tr");
         const item = this.data.items.find((entry) => entry.key === row.dataset.key);
         const action = JSON.parse(button.dataset.action);
@@ -1299,9 +1363,9 @@ class PluginSyncManagerView extends ItemView {
         }
         if (!confirm(`Apply ${label} for ${item.label}?\n\n${extra}`)) return;
         try {
-          this.applyAction(action);
+          await this.applyAction(action);
           new Notice(`Applied: ${label}`);
-          this.refreshKeepingPosition();
+          await this.refreshKeepingPosition();
         } catch (error) {
           new Notice(error.message);
         }
@@ -1309,7 +1373,7 @@ class PluginSyncManagerView extends ItemView {
     });
 
     tbody.querySelectorAll("button[data-role='copy-config-key']").forEach((button) => {
-      button.addEventListener("click", () => {
+      button.addEventListener("click", async () => {
         const row = button.closest("tr");
         const item = this.data.items.find((entry) => entry.key === row.dataset.key);
         const property = button.dataset.property;
@@ -1317,9 +1381,9 @@ class PluginSyncManagerView extends ItemView {
         const label = `${source === DESKTOP ? "PC -> Mobile" : "Mobile -> PC"} for ${item.label} / ${property}`;
         if (!confirm(`Copy this single config value?\n\n${label}\n\nThe target config file is backed up first.`)) return;
         try {
-          this.copyConfigKey({ key: item.key, property, source });
+          await this.copyConfigKey({ key: item.key, property, source });
           new Notice(`Copied: ${label}`);
-          this.refreshKeepingPosition();
+          await this.refreshKeepingPosition();
         } catch (error) {
           new Notice(error.message);
         }

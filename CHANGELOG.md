@@ -5,6 +5,7 @@
 - Updated repository references after renaming the GitHub repository to `diegomarzaa/obsidian-extensions-sync-manager`.
 - Added a release workflow for future tags that publishes `main.js`, `manifest.json`, and `styles.css`.
 - Added GitHub artifact attestations for future release assets using `actions/attest@v4`.
+- Replaced direct Node.js filesystem access with Obsidian's vault adapter for profile scanning, copying, backups, and removal.
 - No new release was published for these changes.
 
 ## 0.1.2
